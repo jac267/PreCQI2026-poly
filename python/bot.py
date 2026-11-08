@@ -6,8 +6,14 @@ Pour l'instant, chaque déneigeuse se déplace au hasard.
 
 from dataclasses import dataclass, field
 from collections import deque
+from math import ceil
 
-from models import GameState, Orders, Position
+from models import Call, GameState, Orders, Position
+
+_previous_positions: dict[str, tuple[int, int]] = {}
+_big_post_slots: dict[str, int] = {}
+_big_returning_to_post: set[str] = set()
+_big_patrol_targets: dict[str, tuple[int, int]] = {}
 
 
 @dataclass(frozen=True)
@@ -26,6 +32,21 @@ class Road:
     exit: tuple[int, int]
     cells: tuple[tuple[int, int], ...]
     locked_by: set[str] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class CallPlan:
+    call: Call
+    path: tuple[tuple[int, int], ...]
+    required_plows: int
+
+
+@dataclass(frozen=True)
+class BigPost:
+    depot: tuple[int, int]
+    side: str
+    position: tuple[int, int]
+    patrol: tuple[tuple[int, int], ...]
 
 
 def build_graph(state: GameState) -> dict[tuple[int, int], GraphNode]:
@@ -68,6 +89,245 @@ def build_graph(state: GameState) -> dict[tuple[int, int], GraphNode]:
         )
 
     return nodes
+
+
+def garage_parking_target(state: GameState, graph):
+    garage = (state.garage.x, state.garage.y)
+    garage_node = graph.get(garage)
+    if garage_node is None:
+        return None
+    for position in garage_node.neighbors.values():
+        return (position.x, position.y)
+    return garage
+
+
+def build_big_posts(state: GameState, graph):
+    posts = []
+    used_positions = set()
+    depots = [
+        (x, y)
+        for y in range(state.map.height)
+        for x in range(state.map.width)
+        if state.map.tile(x, y) == "D"
+    ]
+    for depot in sorted(depots):
+        x, y = depot
+        patrol = []
+        for dx, dy in ((0, -1), (1, 0), (0, 1), (-1, 0)):
+            cell = ((x + dx) % state.map.width, (y + dy) % state.map.height)
+            if cell in graph and cell not in patrol:
+                patrol.append(cell)
+
+        for side, dy in (("N", -1), ("S", 1)):
+            desired = (x, (y + dy) % state.map.height)
+            candidates = sorted(
+                graph,
+                key=lambda cell: (
+                    min(abs(cell[0] - desired[0]), state.map.width - abs(cell[0] - desired[0]))
+                    + min(abs(cell[1] - desired[1]), state.map.height - abs(cell[1] - desired[1])),
+                    cell,
+                ),
+            )
+            position = next(
+                (cell for cell in candidates if cell not in used_positions),
+                None,
+            )
+            if position is None:
+                continue
+            used_positions.add(position)
+            posts.append(BigPost(depot, side, position, tuple(patrol)))
+
+    return posts
+
+
+def assign_big_posts(state: GameState, graph):
+    big_plows = sorted(
+        (plow for plow in state.my_plows if plow.type == "big"),
+        key=lambda plow: plow.id,
+    )
+    posts = build_big_posts(state, graph)
+    current_ids = {plow.id for plow in big_plows}
+    for plow_id in set(_big_post_slots) - current_ids:
+        del _big_post_slots[plow_id]
+
+    assignments = {}
+    used_slots = set()
+    for plow in big_plows:
+        slot = _big_post_slots.get(plow.id)
+        if slot is not None and slot < len(posts) and slot not in used_slots:
+            pass
+        else:
+            position = (
+                plow.position.x % state.map.width,
+                plow.position.y % state.map.height,
+            )
+            slot = next(
+                (
+                    index
+                    for index, post in enumerate(posts)
+                    if post.position == position and index not in used_slots
+                ),
+                None,
+            )
+            if slot is None:
+                slot = next(
+                    (index for index in range(len(posts)) if index not in used_slots),
+                    None,
+                )
+            if slot is None:
+                continue
+            _big_post_slots[plow.id] = slot
+
+        used_slots.add(slot)
+        assignments[plow.id] = posts[slot]
+
+    return assignments
+
+
+def next_big_patrol_move(graph, start, post, plow_id, allow_advance):
+    if not post.patrol:
+        return None
+
+    target = _big_patrol_targets.get(plow_id)
+    reached_target = target == start
+    if target == start:
+        if not allow_advance:
+            return None
+        _big_patrol_targets.pop(plow_id, None)
+        target = None
+
+    if target is None and start in post.patrol and (
+        reached_target or start == post.position
+    ):
+        index = post.patrol.index(start)
+        target = post.patrol[(index + 1) % len(post.patrol)]
+    elif target is None and start != post.position:
+        target = post.position
+    elif target is None:
+        distances, first_directions = shortest_paths(graph, start)
+        reachable = [cell for cell in post.patrol if cell in distances]
+        if not reachable:
+            return None
+        target = min(reachable, key=distances.get)
+    _big_patrol_targets[plow_id] = target
+
+    _, first_directions = shortest_paths(graph, start)
+    direction = first_directions.get(target)
+    if direction is None:
+        return None
+    next_position = graph[start].neighbors[direction]
+    return direction, (next_position.x, next_position.y)
+
+
+def synchronized_big_moves(
+    state, graph, posts, capacity, reserved_cells, normal_reserved_cells
+):
+    groups = {}
+    for plow in state.my_plows:
+        if plow.type == "big" and plow.id in posts:
+            groups.setdefault(posts[plow.id].depot, []).append(plow)
+
+    moves = {}
+    paused_depots = set()
+    for depot, plows in groups.items():
+        if any(plow.broken for plow in plows):
+            paused_depots.add(depot)
+            for plow in plows:
+                _big_returning_to_post.add(plow.id)
+                _big_patrol_targets.pop(plow.id, None)
+            continue
+
+        if any(
+            plow.id in _big_returning_to_post
+            or (plow.load is not None and plow.load >= capacity)
+            for plow in plows
+        ):
+            paused_depots.add(depot)
+
+        if depot in paused_depots:
+            continue
+
+        group_ready = all(
+            (
+                _big_patrol_targets.get(plow.id)
+                == (
+                    plow.position.x % state.map.width,
+                    plow.position.y % state.map.height,
+                )
+            )
+            or (
+                plow.id not in _big_patrol_targets
+                and (
+                    plow.position.x % state.map.width,
+                    plow.position.y % state.map.height,
+                )
+                == posts[plow.id].position
+            )
+            for plow in plows
+        )
+
+        for plow in plows:
+            start = (
+                plow.position.x % state.map.width,
+                plow.position.y % state.map.height,
+            )
+            current_target = _big_patrol_targets.get(plow.id)
+            if not group_ready and (
+                current_target == start
+                or (current_target is None and start == posts[plow.id].position)
+            ):
+                continue
+
+            occupied_cells = reserved_cells | {
+                (
+                    other.position.x % state.map.width,
+                    other.position.y % state.map.height,
+                )
+                for other in state.plows
+                if other.id != plow.id
+            }
+            plow_graph = graph_without_locked_roads(
+                graph, {}, plow.id, start, occupied_cells
+            )
+            move = next_big_patrol_move(
+                plow_graph, start, posts[plow.id], plow.id, group_ready
+            )
+            if move is None:
+                if current_target != start:
+                    paused_depots.add(depot)
+                continue
+
+            direction, destination = move
+            moves[plow.id] = direction
+            if (
+                len(graph[destination].neighbors) >= 3
+                and normal_near_intersection(
+                    state, destination, normal_reserved_cells
+                )
+            ):
+                paused_depots.add(depot)
+
+    return moves, paused_depots
+
+
+def normal_near_intersection(state: GameState, intersection, reserved_cells):
+    normal_cells = set(reserved_cells)
+    normal_cells.update(
+        (
+            plow.position.x % state.map.width,
+            plow.position.y % state.map.height,
+        )
+        for plow in state.my_plows
+        if plow.type == "normal"
+    )
+    for cell in normal_cells:
+        dx = abs(cell[0] - intersection[0])
+        dy = abs(cell[1] - intersection[1])
+        dx = min(dx, state.map.width - dx)
+        dy = min(dy, state.map.height - dy)
+        if dx + dy <= 1:
+            return True
+    return False
 
 
 def build_roads(graph):
@@ -173,7 +433,7 @@ def next_direction_to_target(
     return first_directions.get(target_key)
 
 
-def shortest_paths(graph, start: tuple[int, int]):
+def shortest_paths(graph, start: tuple[int, int], blocked_first_steps=frozenset()):
     """Retourne les distances et la première direction vers chaque case atteignable."""
     if start not in graph:
         return {}, {}
@@ -186,6 +446,8 @@ def shortest_paths(graph, start: tuple[int, int]):
         current = queue.popleft()
         for direction, position in graph[current].neighbors.items():
             neighbor = (position.x, position.y)
+            if current == start and neighbor in blocked_first_steps:
+                continue
             if neighbor in distances:
                 continue
             distances[neighbor] = distances[current] + 1
@@ -211,6 +473,127 @@ def distances_to_targets(graph, targets: set[tuple[int, int]]):
                 queue.append(neighbor)
 
     return distances
+
+
+def shortest_path_to_any(graph, start, targets):
+    """Retourne un plus court chemin depuis start vers la première cible atteinte."""
+    if start not in graph:
+        return None
+
+    previous = {start: None}
+    queue = deque([start])
+    target = None
+    while queue:
+        current = queue.popleft()
+        if current in targets:
+            target = current
+            break
+        for position in graph[current].neighbors.values():
+            neighbor = (position.x, position.y)
+            if neighbor not in previous:
+                previous[neighbor] = current
+                queue.append(neighbor)
+
+    if target is None:
+        return None
+
+    path = []
+    current = target
+    while current is not None:
+        path.append(current)
+        current = previous[current]
+    return tuple(reversed(path))
+
+
+def make_call_plans(state: GameState, graph, deposit_keys):
+    plans = []
+    for call in state.calls:
+        call_key = (
+            call.position.x % state.map.width,
+            call.position.y % state.map.height,
+        )
+        path = shortest_path_to_any(graph, call_key, deposit_keys)
+        if path is None:
+            continue
+
+        snow_on_path = sum(graph[key].snow for key in path)
+        required_plows = max(1, ceil(snow_on_path * 1.2 / 20))
+        plans.append(CallPlan(call, path, required_plows))
+
+    return sorted(
+        plans,
+        key=lambda plan: plan.call.reward / plan.required_plows,
+        reverse=True,
+    )
+
+
+def assign_call_plows(state: GameState, plans, graph):
+    assignments = {}
+    available = [
+        plow
+        for plow in state.my_plows
+        if plow.type == "normal" and not plow.broken
+    ]
+
+    for plan in plans:
+        target = (
+            plan.call.position.x % state.map.width,
+            plan.call.position.y % state.map.height,
+        )
+        remaining_ticks = max(0, plan.call.expires_at - state.tick)
+        candidates = []
+        for plow in available:
+            start = (
+                plow.position.x % state.map.width,
+                plow.position.y % state.map.height,
+            )
+            occupied_cells = {
+                (
+                    other.position.x % state.map.width,
+                    other.position.y % state.map.height,
+                )
+                for other in state.plows
+                if other.id != plow.id
+            }
+            plow_graph = graph_without_locked_roads(
+                graph, {}, plow.id, start, occupied_cells
+            )
+            distances, _ = shortest_paths(plow_graph, start)
+            if target in distances and distances[target] <= remaining_ticks:
+                candidates.append((distances[target], plow.id, plow))
+
+        minimum_available = ceil(3 * plan.required_plows / 5)
+        if len(candidates) < minimum_available:
+            continue
+
+        candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
+        for _, _, plow in candidates[:plan.required_plows]:
+            assignments[plow.id] = plan
+            available.remove(plow)
+
+    return assignments
+
+
+def next_direction_along_call_path(graph, start, plan, toward_call):
+    """Rejoint le chemin calculé, puis avance vers l'appel ou le dépôt."""
+    route = tuple(reversed(plan.path))
+    if start in route:
+        index = route.index(start)
+        next_index = index + 1 if toward_call else index - 1
+        if next_index < 0 or next_index >= len(route):
+            return None
+        target = route[next_index]
+        for direction, position in graph[start].neighbors.items():
+            if (position.x, position.y) == target:
+                return direction
+        return None
+
+    distances, first_directions = shortest_paths(graph, start)
+    reachable_path = [key for key in route if key in distances]
+    if not reachable_path:
+        return None
+    nearest_path = min(reachable_path, key=distances.get)
+    return first_directions.get(nearest_path)
 
 
 def unload_targets(state: GameState) -> list[Position]:
@@ -272,6 +655,8 @@ def decide(state: GameState) -> Orders:
     deposit_keys = {
         (position.x, position.y) for position in unload_targets(state)
     }
+    call_plans = make_call_plans(state, graph, deposit_keys)
+    call_assignments = assign_call_plows(state, call_plans, graph)
     return_distances = distances_to_targets(graph, deposit_keys)
     capacity = state.constants["plowCapacity"]
     reserved_cells = set()
@@ -281,8 +666,8 @@ def decide(state: GameState) -> Orders:
         "E": (1, 0),
         "O": (-1, 0),
     }
-
-    for plow in my_plows:
+    ordered_plows = sorted(my_plows, key=lambda plow: plow.type == "big")
+    for plow in ordered_plows:
         start = (plow.position.x % state.map.width, plow.position.y % state.map.height)
         occupied_cells = reserved_cells | {
             (
@@ -292,8 +677,11 @@ def decide(state: GameState) -> Orders:
             for other in state.plows
             if other.id != plow.id
         }
+        assigned_call = call_assignments.get(plow.id)
+        is_big = plow.type == "big"
+        blocked_roads = {} if assigned_call is not None or is_big else roads
         plow_graph = graph_without_locked_roads(
-            graph, roads, plow.id, start, occupied_cells
+            graph, blocked_roads, plow.id, start, occupied_cells
         )
         outbound_distances, first_directions = shortest_paths(plow_graph, start)
         return_distances = distances_to_targets(plow_graph, deposit_keys)
@@ -301,23 +689,71 @@ def decide(state: GameState) -> Orders:
         if plow.broken:
             garage = (state.garage.x, state.garage.y)
             direction = first_directions.get(garage)
+        elif is_big:
+            target = garage_parking_target(state, graph)
+            direction = (
+                first_directions.get(target)
+                if target is not None and start != target
+                else None
+            )
         elif plow.load is not None and plow.load >= capacity:
             if start in deposit_keys:
                 orders.unload(plow)
                 continue
+            previous_position = _previous_positions.get(plow.id)
+            blocked_first_steps = (
+                {previous_position} if previous_position is not None else set()
+            )
+            call_plan = call_assignments.get(plow.id)
+            direction = None
+            if call_plan is not None:
+                route = tuple(reversed(call_plan.path))
+                if start in route:
+                    index = route.index(start)
+                    if (
+                        index > 0
+                        and previous_position == route[index - 1]
+                    ):
+                        call_plan = None
+                if call_plan is not None:
+                    direction = next_direction_along_call_path(
+                        plow_graph, start, call_plan, toward_call=False
+                    )
+
+            outbound_distances, first_directions = shortest_paths(
+                plow_graph, start, blocked_first_steps
+            )
             reachable_deposits = {
                 target
                 for target in deposit_keys.intersection(outbound_distances)
                 if road_by_cell.get(target) is None
                 or not roads[road_by_cell[target]].locked_by - {plow.id}
             }
+            if not reachable_deposits and blocked_first_steps:
+                outbound_distances, first_directions = shortest_paths(
+                    plow_graph, start
+                )
+                reachable_deposits = {
+                    target
+                    for target in deposit_keys.intersection(outbound_distances)
+                    if road_by_cell.get(target) is None
+                    or not roads[road_by_cell[target]].locked_by - {plow.id}
+                }
             if not reachable_deposits:
                 continue
             target = min(reachable_deposits, key=outbound_distances.get)
-            direction = first_directions.get(target)
+            if direction is None:
+                direction = first_directions.get(target)
             road_key = road_by_cell.get(target)
-            if road_key is not None:
+            if road_key is not None and not is_big:
                 roads[road_key].locked_by.add(plow.id)
+        elif plow.id in call_assignments:
+            direction = next_direction_along_call_path(
+                plow_graph,
+                start,
+                call_assignments[plow.id],
+                toward_call=True,
+            )
         else:
             target = best_snow_target(
                 graph,
@@ -336,10 +772,19 @@ def decide(state: GameState) -> Orders:
         if direction is not None:
             orders.move(plow, direction)
             dx, dy = direction_steps[direction]
-            reserved_cells.add(
-                (
-                    (plow.position.x + dx) % state.map.width,
-                    (plow.position.y + dy) % state.map.height,
-                )
+            destination = (
+                (plow.position.x + dx) % state.map.width,
+                (plow.position.y + dy) % state.map.height,
             )
+            reserved_cells.add(destination)
+    _previous_positions.clear()
+    _previous_positions.update(
+        {
+            plow.id: (
+                plow.position.x % state.map.width,
+                plow.position.y % state.map.height,
+            )
+            for plow in state.plows
+        }
+    )
     return orders
