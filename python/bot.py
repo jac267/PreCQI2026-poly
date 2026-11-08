@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Iterator
 
-from models import GameState, Orders, Position
+from models import Call, GameState, Orders, Position
 
 
 DIRECTIONS = (("N", 0, -1), ("S", 0, 1), ("E", 1, 0), ("O", -1, 0))
@@ -176,6 +176,15 @@ class DecisionNode:
     parent: "DecisionNode | None" = None
 
 
+@dataclass(frozen=True)
+class CallPlan:
+    """Appel priorisé et corridor de collecte entre l'appel et un dépôt."""
+
+    call: Call
+    path: tuple[int, ...]  # De l'appel vers une case de déchargement.
+    required_plows: int
+
+
 def decision_tree(
     neighbors: Neighbors, snow: list[int], start: int, free_capacity: int
 ) -> Iterator[DecisionNode]:
@@ -277,6 +286,129 @@ def route_cells(
     return tuple(cells)
 
 
+def shortest_path_to_any(
+    neighbors: Neighbors, start: int, targets: set[int]
+) -> tuple[int, ...]:
+    """Chemin le plus court dans le graphe incluant les obstacles du tour."""
+    previous: dict[int, int | None] = {start: None}
+    queue = deque([start])
+    while queue:
+        current = queue.popleft()
+        if current in targets:
+            cells = []
+            cursor: int | None = current
+            while cursor is not None:
+                cells.append(cursor)
+                cursor = previous[cursor]
+            return tuple(reversed(cells))
+        for _, target in neighbors[current]:
+            if target not in previous:
+                previous[target] = current
+                queue.append(target)
+    return ()
+
+
+def make_call_plans(state: GameState, paths: MapPaths, snow: list[int]) -> list[CallPlan]:
+    """Porte la priorité récompense / effectif requis de origin/main."""
+    if not state.calls:
+        return []
+    distances, moves = return_routes(paths, paths.neighbors, paths.depots, set())
+    capacity = state.constants["plowCapacity"]
+    plans = []
+    for call in state.calls:
+        if call.expires_at < state.tick:
+            continue
+        target = paths.indices.get((
+            call.position.x % state.map.width, call.position.y % state.map.height
+        ))
+        if target is None:
+            continue
+        route = route_cells(paths.neighbors, target, distances, moves)
+        if not route:
+            continue
+        snow_on_path = sum(snow[cell] for cell in route)
+        # ceil(neige * 1.2 / capacité), avec une marge de 20 % comme origin/main.
+        required = max(1, (6 * snow_on_path + 5 * capacity - 1) // (5 * capacity))
+        plans.append(CallPlan(call, route, required))
+    return sorted(
+        plans, key=lambda plan: plan.call.reward / plan.required_plows, reverse=True
+    )
+
+
+def blocked_cells(
+    state: GameState, paths: MapPaths, positions: dict[str, int | None],
+    mutexes: TileMutexes, plow_id: str,
+) -> set[int]:
+    occupied = {
+        cell
+        for other in state.plows
+        if other.id != plow_id and not other.broken
+        if (cell := positions[other.id]) is not None
+        if state.map.tile(*paths.cells[cell]) != "G"
+    }
+    blocked = occupied | mutexes.blocked_for(plow_id)
+    start = positions[plow_id]
+    if start is not None:
+        blocked.discard(start)
+    return blocked
+
+
+def assign_call_plows(
+    state: GameState, plans: list[CallPlan], paths: MapPaths,
+    positions: dict[str, int | None], mutexes: TileMutexes,
+) -> dict[str, CallPlan]:
+    """Affecte les plus proches bots sains, gros ou normaux, avant expiration."""
+    if not plans:
+        return {}
+    available = [
+        plow for plow in state.my_plows
+        if not plow.broken
+        and (start := positions[plow.id]) is not None
+        and mutexes.owners[start] == plow.id
+    ]
+    graphs = {
+        plow.id: available_neighbors(paths, blocked_cells(state, paths, positions, mutexes, plow.id))
+        for plow in available
+    }
+    assignments = {}
+    for plan in plans:
+        remaining_ticks = plan.call.expires_at - state.tick
+        candidates = []
+        for plow in available:
+            start = positions[plow.id]
+            if start is None:
+                continue
+            route = shortest_path_to_any(graphs[plow.id], start, {plan.path[0]})
+            if route and len(route) - 1 <= remaining_ticks:
+                candidates.append((len(route) - 1, plow.id, plow))
+        # Il faut au moins 60 % de l'effectif estimé, comme dans origin/main.
+        if len(candidates) < (3 * plan.required_plows + 4) // 5:
+            continue
+        candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
+        for _, _, plow in candidates[:plan.required_plows]:
+            assignments[plow.id] = plan
+            available.remove(plow)
+    return assignments
+
+
+def route_to_call(
+    neighbors: Neighbors, start: int, plan: CallPlan, remaining_ticks: int
+) -> tuple[int, ...]:
+    """Rejoint le corridor puis avance vers l'appel, sans traverser de mutex."""
+    corridor = tuple(reversed(plan.path))
+    connector = shortest_path_to_any(neighbors, start, set(corridor))
+    if connector:
+        route = connector + corridor[corridor.index(connector[-1]) + 1:]
+        if len(route) - 1 <= remaining_ticks and all(
+            any(target == after for _, target in neighbors[before])
+            for before, after in zip(route, route[1:])
+        ):
+            return route
+    # Un corridor réservé ou trop lent peut avoir un autre accès à l'appel.
+    route = shortest_path_to_any(neighbors, start, {plan.path[0]})
+    return route if route and len(route) - 1 <= remaining_ticks else ()
+
+
 def next_direction_to_target(
     state: GameState, start: Position, target: Position
 ) -> str | None:
@@ -315,9 +447,9 @@ def decide(state: GameState) -> Orders:
     if (
         len(my_plows) < MAX_PLOWS
         and not garage_occupied
-        and state.money >= state.constants["plowCost"]["normal"]
+        and state.money >= state.constants["plowCost"]["big"]
     ):
-        orders.buy = "normal"
+        orders.buy = "big"
 
     if my_plows:
         offset = state.tick % len(my_plows)
@@ -330,20 +462,19 @@ def decide(state: GameState) -> Orders:
         if start is not None:
             mutexes.acquire(plow.id, (start,))
 
+    call_plans = make_call_plans(state, paths, snow)
+    call_assignments = assign_call_plows(state, call_plans, paths, positions, mutexes)
+    # Les appels les plus rentables passent avant la collecte générale. Les
+    # affectations gardent l'ordre priorité puis proximité établi ci-dessus.
+    call_order = {plow_id: index for index, plow_id in enumerate(call_assignments)}
+    my_plows.sort(key=lambda plow: call_order.get(plow.id, len(call_order)))
     for plow in my_plows:
         start = positions[plow.id]
         if start is None:
             continue
         if not mutexes.acquire(plow.id, (start,)):
             continue  # Plusieurs bots peuvent physiquement partager un garage.
-        occupied = {
-            cell
-            for other in state.plows
-            if other.id != plow.id and not other.broken
-            if (cell := positions[other.id]) is not None
-            if game_map.tile(*paths.cells[cell]) != "G"
-        }
-        blocked = (occupied | mutexes.blocked_for(plow.id)) - {start}
+        blocked = blocked_cells(state, paths, positions, mutexes, plow.id)
         neighbors = available_neighbors(paths, blocked)
         return_distances, return_moves = return_routes(paths, neighbors, paths.depots, blocked)
         load = plow.load or 0
@@ -367,17 +498,38 @@ def decide(state: GameState) -> Orders:
         elif return_distances[start] < 0:
             continue  # Aucune neige ne peut être livrée depuis cette composante.
         else:
-            best = best_decision(neighbors, snow, start, capacity - load, return_distances)
-            if best is not None:
-                chosen_cells = decision_cells(best) + route_cells(
-                    neighbors, best.cell, return_distances, return_moves
+            call_plan = call_assignments.get(plow.id)
+            call_route = route_to_call(
+                neighbors, start, call_plan, call_plan.call.expires_at - state.tick
+            ) if call_plan is not None else ()
+            if call_route:
+                # Comme l'arbre, le trajet de collecte s'arrête si le bot est plein.
+                collected = 0
+                end = 0
+                for end, cell in enumerate(call_route[1:], 1):
+                    collected += min(snow[cell], capacity - load - collected)
+                    if collected >= capacity - load:
+                        break
+                chosen_cells = call_route[:end + 1] + route_cells(
+                    neighbors, call_route[end], return_distances, return_moves
                 )[1:]
-                direction = best.first_direction
-            elif load > 0:
-                chosen_cells = route_cells(neighbors, start, return_distances, return_moves)
-                direction = return_moves[start]
+                direction = next(
+                    (move for move, target in neighbors[start]
+                     if len(call_route) > 1 and target == call_route[1]),
+                    None,
+                )
             else:
-                direction = None
+                best = best_decision(neighbors, snow, start, capacity - load, return_distances)
+                if best is not None:
+                    chosen_cells = decision_cells(best) + route_cells(
+                        neighbors, best.cell, return_distances, return_moves
+                    )[1:]
+                    direction = best.first_direction
+                elif load > 0:
+                    chosen_cells = route_cells(neighbors, start, return_distances, return_moves)
+                    direction = return_moves[start]
+                else:
+                    direction = None
 
         if direction is not None and mutexes.acquire(plow.id, chosen_cells):
             orders.move(plow, direction)

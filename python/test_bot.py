@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import bot
-from models import GameMap, GameState, Plow, Position
+from models import Call, GameMap, GameState, Plow, Position
 
 
 def trajectory(node):
@@ -50,7 +50,7 @@ def make_state(tiles=("#######", "#G..D##", "#######"), position=(1, 1), load=0,
         tick=1, you="us", money=money, garage=Position(1, 1),
         plows=[Plow("ours", "us", Position(*position), "normal", broken, load), *others],
         map=GameMap(width, height, list(tiles), snow or [[0] * width for _ in tiles]),
-        calls=[], errors=[], constants={"plowCapacity": 20, "plowCost": {"normal": 250}},
+        calls=[], errors=[], constants={"plowCapacity": 20, "plowCost": {"normal": 250, "big": 400}},
     )
 
 
@@ -416,8 +416,167 @@ class FleetPlanningTests(unittest.TestCase):
                         )
 
 
+class CallFocusTests(unittest.TestCase):
+    def focused_state(self, plow_type='big'):
+        state = make_fleet_state()
+        state.plows = [state.plows[1]]
+        state.plows[0].type = plow_type
+        state.calls = [Call('lower', Position(5, 3), 100, 100)]
+        return state
+
+    def assignment_inputs(self, state):
+        paths = bot.map_paths(state.map.width, state.map.height, tuple(state.map.tiles))
+        positions = {plow.id: paths.indices[(plow.position.x, plow.position.y)] for plow in state.plows}
+        mutexes = bot.TileMutexes(len(paths.cells))
+        for plow in state.my_plows:
+            mutexes.acquire(plow.id, (positions[plow.id],))
+        snow = [state.map.snow[y][x] for x, y in paths.cells]
+        return paths, positions, mutexes, snow
+
+    def test_normal_and_big_plows_focus_calls_over_snow_tree(self):
+        for plow_type in ('normal', 'big'):
+            with self.subTest(plow_type=plow_type):
+                state = self.focused_state(plow_type)
+                with patch.object(bot, 'best_decision', wraps=bot.best_decision) as search:
+                    orders = bot.decide(state)
+                self.assertEqual(orders.actions[0]['direction'], 'E')
+                search.assert_not_called()
+                state.calls = []
+                self.assertEqual(bot.decide(state).actions[0]['direction'], 'N')
+
+    def test_plans_rank_reward_per_required_plow_and_use_capacity(self):
+        state = make_state()
+        state.map.snow[1][2] = 20
+        state.map.snow[1][3] = 10
+        state.calls = [Call('large', Position(2, 1), 100, 100), Call('small', Position(3, 1), 60, 100)]
+        paths, _, _, snow = self.assignment_inputs(state)
+        plans = bot.make_call_plans(state, paths, snow)
+        self.assertEqual([(plan.call.id, plan.required_plows) for plan in plans], [('small', 1), ('large', 2)])
+        state.constants['plowCapacity'] = 10
+        plans = bot.make_call_plans(state, paths, snow)
+        self.assertEqual({plan.call.id: plan.required_plows for plan in plans}, {'small': 2, 'large': 4})
+
+    def test_expired_or_too_distant_calls_fall_back_to_tree(self):
+        for expiry in (-1, 1):
+            with self.subTest(expiry=expiry):
+                state = self.focused_state()
+                state.calls[0].expires_at = expiry
+                self.assertEqual(bot.decide(state).actions[0]['direction'], 'N')
+
+    def test_zero_snow_call_is_still_pursued(self):
+        state = make_state(money=0)
+        state.calls = [Call('empty', Position(2, 1), 150, 100)]
+        self.assertEqual(bot.decide(state).actions[0]['direction'], 'E')
+
+    def test_plow_already_on_call_waits_to_collect_without_wandering(self):
+        state = self.focused_state()
+        state.plows[0].position = Position(5, 3)
+        self.assertEqual(bot.decide(state).actions, [])
+
+    def test_invalid_and_depot_disconnected_calls_are_ignored(self):
+        state = make_state(('#########', '#G..D####', '#########', '######.##', '#########'))
+        state.calls = [Call('wall', Position(0, 0), 100, 100), Call('isolated', Position(6, 3), 100, 100)]
+        paths, _, _, snow = self.assignment_inputs(state)
+        self.assertEqual(bot.make_call_plans(state, paths, snow), [])
+
+    def test_call_positions_wrap_around_map_edges(self):
+        state = self.focused_state()
+        state.calls[0].position = Position(5 + state.map.width, 3 - state.map.height)
+        self.assertEqual(bot.decide(state).actions[0]['direction'], 'E')
+
+    def test_at_least_sixty_percent_of_required_plows_must_be_available(self):
+        other = Plow('second', 'us', Position(1, 2), 'big', False, 0)
+        state = make_state(('#######', '#G...D#', '#....##', '#######'), others=(other,))
+        call = Call('crew', Position(4, 1), 100, 100)
+        paths, positions, mutexes, _ = self.assignment_inputs(state)
+        plan = bot.CallPlan(call, (paths.indices[(4, 1)],), 3)
+        assigned = bot.assign_call_plows(state, [plan], paths, positions, mutexes)
+        self.assertEqual(set(assigned), {'ours', 'second'})
+        other.broken = True
+        assigned = bot.assign_call_plows(state, [plan], paths, positions, mutexes)
+        self.assertEqual(assigned, {})
+
+    def test_calls_assign_nearest_plow_then_assign_each_plow_at_most_once(self):
+        others = (
+            Plow('second', 'us', Position(2, 2), 'big', False, 0),
+            Plow('nearest', 'us', Position(4, 2), 'big', False, 0),
+        )
+        state = make_state(('#######', '#G...D#', '#....##', '#######'), others=others)
+        paths, positions, mutexes, _ = self.assignment_inputs(state)
+        plans = [
+            bot.CallPlan(Call('first', Position(4, 1), 150, 100), (paths.indices[(4, 1)],), 1),
+            bot.CallPlan(Call('second', Position(2, 1), 100, 100), (paths.indices[(2, 1)],), 1),
+        ]
+        assigned = bot.assign_call_plows(state, plans, paths, positions, mutexes)
+        self.assertEqual({plow_id: plan.call.id for plow_id, plan in assigned.items()}, {'nearest': 'first', 'ours': 'second'})
+
+    def test_assigned_call_gets_priority_over_unassigned_tree_search(self):
+        state = make_fleet_state()
+        state.calls = [Call('lower', Position(5, 3), 100, 100)]
+        orders = bot.decide(state)
+        self.assertEqual(orders.actions[0], {'plowId': 'second', 'type': 'move', 'direction': 'E'})
+
+    def test_two_call_assignments_keep_routes_exclusive(self):
+        state = make_fleet_state()
+        state.calls = [Call('upper', Position(4, 1), 150, 100), Call('lower', Position(5, 3), 100, 100)]
+        with patch.object(bot, 'best_decision', wraps=bot.best_decision) as search:
+            orders = bot.decide(state)
+        self.assertEqual({action['plowId']: action['direction'] for action in orders.actions}, {'ours': 'E', 'second': 'E'})
+        search.assert_not_called()
+
+    def test_plows_assigned_same_call_cannot_enter_each_others_locked_path(self):
+        other = Plow('second', 'us', Position(1, 2), 'big', False, 0)
+        state = make_state(('#######', '#G...D#', '#....##', '#######'), others=(other,), money=0)
+        state.tick = 0
+        state.map.snow[1][3] = state.map.snow[1][4] = 10
+        state.calls = [Call('shared', Position(3, 1), 150, 100)]
+        orders = bot.decide(state)
+        self.assertEqual(orders.actions, [{'plowId': 'ours', 'type': 'move', 'direction': 'E'}])
+
+    def test_full_and_broken_plows_still_return_and_repair(self):
+        state = self.focused_state()
+        state.plows[0].load = 20
+        self.assertEqual(bot.decide(state).actions[0]['direction'], 'E')
+        state.plows[0].position = Position(3, 1)
+        state.plows[0].broken = True
+        self.assertEqual(bot.decide(state).actions[0]['direction'], 'O')
+
+    def test_blocked_call_corridor_uses_alternate_route_if_deadline_allows(self):
+        neighbors = ((('E', 1), ('S', 2)), (('O', 0),), (('N', 0), ('E', 3)), (('O', 2),), ())
+        plan = bot.CallPlan(Call('detour', Position(0, 0), 100, 100), (3, 4, 1), 1)
+        self.assertEqual(bot.route_to_call(neighbors, 0, plan, 2), (0, 2, 3))
+        self.assertEqual(bot.route_to_call(neighbors, 0, plan, 1), ())
+
+    def test_big_plow_completes_call_then_delivers_collected_snow(self):
+        state = self.focused_state()
+        plow = state.my_plows[0]
+        steps = {'N': (0, -1), 'S': (0, 1), 'E': (1, 0), 'O': (-1, 0)}
+        for _ in range(3):
+            orders = bot.decide(state)
+            self.assertIsNone(orders.buy)
+            for action in orders.actions:
+                if action['type'] == 'unload':
+                    state.money += plow.load
+                    plow.load = 0
+                else:
+                    dx, dy = steps[action['direction']]
+                    plow.position = Position(plow.position.x + dx, plow.position.y + dy)
+            x, y = plow.position.x, plow.position.y
+            pickup = min(state.map.snow[y][x], 20 - plow.load)
+            plow.load += pickup
+            state.map.snow[y][x] -= pickup
+            for call in list(state.calls):
+                if plow.position == call.position and state.map.snow[y][x] == 0:
+                    state.money += call.reward
+                    state.calls.remove(call)
+            state.tick += 1
+        self.assertEqual(state.calls, [])
+        self.assertEqual(state.money, 102)
+        self.assertEqual(plow.load, 0)
+
+
 class PurchaseTests(unittest.TestCase):
-    def fleet_state(self, count, money=250):
+    def fleet_state(self, count, money=400):
         state = make_state(('############', '#G........D#', '############'), position=(2, 1), money=money)
         state.plows.extend(
             Plow(f'plow-{index}', 'us', Position(index + 2, 1), 'normal', False, 0)
@@ -425,10 +584,10 @@ class PurchaseTests(unittest.TestCase):
         )
         return state
 
-    def test_buys_normal_plow_below_six_when_affordable_and_garage_free(self):
+    def test_buys_only_big_plows_below_six_when_affordable_and_garage_free(self):
         for count in (1, 5):
             with self.subTest(count=count):
-                self.assertEqual(bot.decide(self.fleet_state(count)).buy, 'normal')
+                self.assertEqual(bot.decide(self.fleet_state(count)).buy, 'big')
 
     def test_does_not_buy_when_already_at_or_above_six(self):
         for count in (6, 7):
@@ -436,11 +595,13 @@ class PurchaseTests(unittest.TestCase):
                 self.assertIsNone(bot.decide(self.fleet_state(count, money=10000)).buy)
 
     def test_does_not_buy_without_enough_money(self):
-        self.assertIsNone(bot.decide(self.fleet_state(1, money=249)).buy)
+        for money in (249, 250, 399):
+            with self.subTest(money=money):
+                self.assertIsNone(bot.decide(self.fleet_state(1, money=money)).buy)
 
     def test_purchase_uses_server_cost_and_counts_broken_plows(self):
-        state = self.fleet_state(5, money=250)
-        state.constants['plowCost']['normal'] = 300
+        state = self.fleet_state(5, money=400)
+        state.constants['plowCost']['big'] = 500
         self.assertIsNone(bot.decide(state).buy)
         state = self.fleet_state(6, money=10000)
         state.plows[-1].broken = True
@@ -449,7 +610,7 @@ class PurchaseTests(unittest.TestCase):
     def test_other_teams_do_not_count_toward_fleet_limit(self):
         state = self.fleet_state(5)
         state.plows.append(Plow('enemy', 'them', Position(8, 1), 'normal', False, None))
-        self.assertEqual(bot.decide(state).buy, 'normal')
+        self.assertEqual(bot.decide(state).buy, 'big')
 
     def test_no_purchase_when_garage_is_occupied_even_if_plow_moves_away(self):
         state = make_state(money=10000)
