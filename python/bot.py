@@ -1,4 +1,4 @@
-"""Planifie les trajets de six déneigeuses au plus avec des mutex par case."""
+"""Planifie les trajets de huit déneigeuses au plus avec des mutex par case."""
 
 from array import array
 from collections import deque
@@ -10,7 +10,8 @@ from models import Call, GameState, Orders, Position
 
 
 DIRECTIONS = (("N", 0, -1), ("S", 0, 1), ("E", 1, 0), ("O", -1, 0))
-MAX_PLOWS = 6
+MAX_PLOWS = 8
+INITIAL_NORMAL_PURCHASES = 3
 Cell = tuple[int, int]
 Neighbors = tuple[tuple[tuple[str, int], ...], ...]
 
@@ -444,12 +445,16 @@ def decide(state: GameState) -> Orders:
         (plow.position.x % game_map.width, plow.position.y % game_map.height) == garage_cell
         for plow in state.plows
     )
+    # La déneigeuse initiale ne compte pas comme un achat. Les bots brisés
+    # restent dans la flotte ; sa taille reflète donc les achats réussis.
+    purchased_count = max(0, len(my_plows) - 1)
+    purchase_type = "normal" if purchased_count < INITIAL_NORMAL_PURCHASES else "big"
     if (
         len(my_plows) < MAX_PLOWS
         and not garage_occupied
-        and state.money >= state.constants["plowCost"]["big"]
+        and state.money >= state.constants["plowCost"][purchase_type]
     ):
-        orders.buy = "big"
+        orders.buy = purchase_type
 
     if my_plows:
         offset = state.tick % len(my_plows)

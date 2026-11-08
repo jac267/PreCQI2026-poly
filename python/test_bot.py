@@ -383,13 +383,13 @@ class FleetPlanningTests(unittest.TestCase):
         state.plows.reverse()
         self.assertEqual(bot.decide(state).to_dict(state.tick), first)
 
-    def test_six_plows_never_share_street_destinations_or_swap_positions(self):
-        rng = random.Random(6)
+    def test_eight_plows_never_share_street_destinations_or_swap_positions(self):
+        rng = random.Random(8)
         tiles = ('G...', '.D..', '....', '....')
         streets = [(x, y) for y, row in enumerate(tiles) for x, tile in enumerate(row) if tile in '.G']
         steps = {'N': (0, -1), 'S': (0, 1), 'E': (1, 0), 'O': (-1, 0)}
         for trial in range(40):
-            starts = rng.sample(streets, 6)
+            starts = rng.sample(streets, 8)
             plows = [Plow(f'p-{index}', 'us', Position(*cell), 'normal', False, rng.choice((0, 9, 19, 20)))
                      for index, cell in enumerate(starts)]
             state = make_state(tiles)
@@ -577,40 +577,73 @@ class CallFocusTests(unittest.TestCase):
 
 class PurchaseTests(unittest.TestCase):
     def fleet_state(self, count, money=400):
-        state = make_state(('############', '#G........D#', '############'), position=(2, 1), money=money)
+        state = make_state(('##################', '#G..............D#', '##################'), position=(2, 1), money=money)
         state.plows.extend(
-            Plow(f'plow-{index}', 'us', Position(index + 2, 1), 'normal', False, 0)
+            Plow(f'plow-{index}', 'us', Position(index + 2, 1),
+                 'normal' if index <= 3 else 'big', False, 0)
             for index in range(1, count)
         )
         return state
 
-    def test_buys_only_big_plows_below_six_when_affordable_and_garage_free(self):
-        for count in (1, 5):
+    def test_first_three_purchases_are_normal_excluding_starting_plow(self):
+        for count in (1, 2, 3):
+            with self.subTest(count=count):
+                self.assertEqual(bot.decide(self.fleet_state(count, money=250)).buy, 'normal')
+
+    def test_buys_big_plows_after_first_three_purchases_until_cap(self):
+        for count in (4, 6, 7):
             with self.subTest(count=count):
                 self.assertEqual(bot.decide(self.fleet_state(count)).buy, 'big')
 
-    def test_does_not_buy_when_already_at_or_above_six(self):
-        for count in (6, 7):
+    def test_does_not_buy_when_already_at_or_above_eight(self):
+        for count in (8, 9):
             with self.subTest(count=count):
                 self.assertIsNone(bot.decide(self.fleet_state(count, money=10000)).buy)
 
     def test_does_not_buy_without_enough_money(self):
+        self.assertIsNone(bot.decide(self.fleet_state(1, money=249)).buy)
         for money in (249, 250, 399):
             with self.subTest(money=money):
-                self.assertIsNone(bot.decide(self.fleet_state(1, money=money)).buy)
+                self.assertIsNone(bot.decide(self.fleet_state(4, money=money)).buy)
 
     def test_purchase_uses_server_cost_and_counts_broken_plows(self):
-        state = self.fleet_state(5, money=400)
+        state = self.fleet_state(3, money=250)
+        state.constants['plowCost']['normal'] = 300
+        self.assertIsNone(bot.decide(state).buy)
+        state = self.fleet_state(7, money=400)
         state.constants['plowCost']['big'] = 500
         self.assertIsNone(bot.decide(state).buy)
-        state = self.fleet_state(6, money=10000)
+        state = self.fleet_state(8, money=10000)
         state.plows[-1].broken = True
         self.assertIsNone(bot.decide(state).buy)
 
     def test_other_teams_do_not_count_toward_fleet_limit(self):
-        state = self.fleet_state(5)
-        state.plows.append(Plow('enemy', 'them', Position(8, 1), 'normal', False, None))
-        self.assertEqual(bot.decide(state).buy, 'big')
+        for count, expected in ((3, 'normal'), (7, 'big')):
+            with self.subTest(count=count):
+                state = self.fleet_state(count)
+                state.plows.append(Plow('enemy', 'them', Position(12, 1), 'normal', False, None))
+                self.assertEqual(bot.decide(state).buy, expected)
+
+    def test_full_purchase_sequence_is_three_normal_then_four_big(self):
+        state = self.fleet_state(1, money=10000)
+        purchases = []
+        for _ in range(7):
+            purchase = bot.decide(state).buy
+            purchases.append(purchase)
+            state.money -= state.constants['plowCost'][purchase]
+            count = len(state.my_plows)
+            state.plows.append(Plow(f'bought-{count}', 'us', Position(count + 2, 1), purchase, False, 0))
+            state.tick += 1
+        self.assertEqual(purchases, ['normal'] * 3 + ['big'] * 4)
+        self.assertEqual(len(state.my_plows), 8)
+        self.assertIsNone(bot.decide(state).buy)
+
+    def test_unsuccessful_purchase_does_not_advance_purchase_stage(self):
+        state = self.fleet_state(3)
+        self.assertEqual(bot.decide(state).buy, 'normal')
+        # Aucun nouveau bot dans l'état suivant : l'achat n'a pas abouti.
+        state.tick += 1
+        self.assertEqual(bot.decide(state).buy, 'normal')
 
     def test_no_purchase_when_garage_is_occupied_even_if_plow_moves_away(self):
         state = make_state(money=10000)
