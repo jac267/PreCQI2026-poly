@@ -124,6 +124,8 @@ def refresh_road_locks(state: GameState, roads, road_by_cell):
         road.locked_by.clear()
 
     for plow in state.plows:
+        if plow.load is None:
+            continue
         cell = (
             plow.position.x % state.map.width,
             plow.position.y % state.map.height,
@@ -133,9 +135,10 @@ def refresh_road_locks(state: GameState, roads, road_by_cell):
             roads[road_key].locked_by.add(plow.id)
 
 
-def graph_without_locked_roads(graph, roads, road_by_cell, plow_id, start):
-    """Retire du graphe les rues réservées par d'autres souffleuses."""
-    blocked_cells = set()
+def graph_without_locked_roads(graph, roads, plow_id, start, occupied_cells):
+    """Retire du graphe les rues réservées et les cases déjà occupées."""
+    blocked_cells = set(occupied_cells)
+    blocked_cells.discard(start)
     for road_key, road in roads.items():
         if road.locked_by - {plow_id} and start not in road.cells:
             blocked_cells.update(road.cells)
@@ -258,8 +261,9 @@ def best_snow_target(
 
 def decide(state: GameState) -> Orders:
     orders = Orders()
+    my_plows = state.my_plows
     normal_plow_cost = state.constants["plowCost"]["normal"]
-    if state.money >= normal_plow_cost:
+    if len(my_plows) < 6 and state.money >= normal_plow_cost:
         orders.buy = "normal"
 
     graph = build_graph(state)
@@ -270,11 +274,26 @@ def decide(state: GameState) -> Orders:
     }
     return_distances = distances_to_targets(graph, deposit_keys)
     capacity = state.constants["plowCapacity"]
+    reserved_cells = set()
+    direction_steps = {
+        "N": (0, -1),
+        "S": (0, 1),
+        "E": (1, 0),
+        "O": (-1, 0),
+    }
 
-    for plow in state.my_plows:
+    for plow in my_plows:
         start = (plow.position.x % state.map.width, plow.position.y % state.map.height)
+        occupied_cells = reserved_cells | {
+            (
+                other.position.x % state.map.width,
+                other.position.y % state.map.height,
+            )
+            for other in state.plows
+            if other.id != plow.id
+        }
         plow_graph = graph_without_locked_roads(
-            graph, roads, road_by_cell, plow.id, start
+            graph, roads, plow.id, start, occupied_cells
         )
         outbound_distances, first_directions = shortest_paths(plow_graph, start)
         return_distances = distances_to_targets(plow_graph, deposit_keys)
@@ -316,4 +335,11 @@ def decide(state: GameState) -> Orders:
 
         if direction is not None:
             orders.move(plow, direction)
+            dx, dy = direction_steps[direction]
+            reserved_cells.add(
+                (
+                    (plow.position.x + dx) % state.map.width,
+                    (plow.position.y + dy) % state.map.height,
+                )
+            )
     return orders

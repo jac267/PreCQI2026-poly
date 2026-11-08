@@ -10,7 +10,7 @@ services:
       - "8080:8080"
     environment:
       TEAMS: "moi"
-      TICK_MS: "${TICK_MS:-400}"
+      TICK_MS: "${TICK_MS:-50}"
       WAIT_FOR_ALL: "${WAIT_FOR_ALL:-0}"
       SEED: "${SEED:-}"
 
