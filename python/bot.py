@@ -4,7 +4,7 @@ decide() est appelée à chaque tour avec l'état du jeu et doit retourner vos o
 Pour l'instant, chaque déneigeuse se déplace au hasard.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import deque
 
 from models import GameState, Orders, Position
@@ -18,6 +18,14 @@ class GraphNode:
     tile: str
     snow: int
     neighbors: dict[str, Position]
+
+
+@dataclass
+class Road:
+    entry: tuple[int, int]
+    exit: tuple[int, int]
+    cells: tuple[tuple[int, int], ...]
+    locked_by: set[str] = field(default_factory=set)
 
 
 def build_graph(state: GameState) -> dict[tuple[int, int], GraphNode]:
@@ -62,6 +70,94 @@ def build_graph(state: GameState) -> dict[tuple[int, int], GraphNode]:
     return nodes
 
 
+def build_roads(graph):
+    """Construit les rues entre jonctions et indexe leurs cases intérieures."""
+    roads = {}
+    road_by_cell = {}
+    visited_edges = set()
+    junctions = {
+        key for key, node in graph.items() if len(node.neighbors) != 2
+    }
+
+    for entry in junctions:
+        for neighbor_position in graph[entry].neighbors.values():
+            neighbor = (neighbor_position.x, neighbor_position.y)
+            first_edge = tuple(sorted((entry, neighbor)))
+            if first_edge in visited_edges:
+                continue
+
+            path = [entry, neighbor]
+            visited_edges.add(first_edge)
+            previous = entry
+            current = neighbor
+            while current not in junctions:
+                next_positions = [
+                    (position.x, position.y)
+                    for position in graph[current].neighbors.values()
+                    if (position.x, position.y) != previous
+                ]
+                if not next_positions:
+                    break
+                next_cell = next_positions[0]
+                edge = tuple(sorted((current, next_cell)))
+                if edge in visited_edges:
+                    break
+                visited_edges.add(edge)
+                path.append(next_cell)
+                previous, current = current, next_cell
+
+            exit_cell = current
+            road_key = tuple(sorted((entry, exit_cell)))
+            road = roads.setdefault(
+                road_key,
+                Road(entry=road_key[0], exit=road_key[1], cells=tuple(path[1:-1])),
+            )
+            for cell in path[1:-1]:
+                road_by_cell[cell] = road_key
+
+    return roads, road_by_cell
+
+
+def refresh_road_locks(state: GameState, roads, road_by_cell):
+    """Reconstruit les verrous depuis les positions actuelles de toutes les souffleuses."""
+    for road in roads.values():
+        road.locked_by.clear()
+
+    for plow in state.plows:
+        cell = (
+            plow.position.x % state.map.width,
+            plow.position.y % state.map.height,
+        )
+        road_key = road_by_cell.get(cell)
+        if road_key is not None:
+            roads[road_key].locked_by.add(plow.id)
+
+
+def graph_without_locked_roads(graph, roads, road_by_cell, plow_id, start):
+    """Retire du graphe les rues réservées par d'autres souffleuses."""
+    blocked_cells = set()
+    for road_key, road in roads.items():
+        if road.locked_by - {plow_id} and start not in road.cells:
+            blocked_cells.update(road.cells)
+
+    available_graph = {}
+    for key, node in graph.items():
+        if key in blocked_cells:
+            continue
+        neighbors = {
+            direction: position
+            for direction, position in node.neighbors.items()
+            if (position.x, position.y) not in blocked_cells
+        }
+        available_graph[key] = GraphNode(
+            position=node.position,
+            tile=node.tile,
+            snow=node.snow,
+            neighbors=neighbors,
+        )
+    return available_graph
+
+
 def next_direction_to_target(
     state: GameState, start: Position, target: Position
 ) -> str | None:
@@ -70,43 +166,48 @@ def next_direction_to_target(
     start_key = (start.x % state.map.width, start.y % state.map.height)
     target_key = (target.x % state.map.width, target.y % state.map.height)
 
-    if start_key not in graph or target_key not in graph:
-        return None
-    if start_key == target_key:
-        return None
+    _, first_directions = shortest_paths(graph, start_key)
+    return first_directions.get(target_key)
 
-    directions = ("N", "S", "E", "O")
-    previous: dict[tuple[int, int], tuple[tuple[int, int], str] | None] = {
-        start_key: None
-    }
-    queue = deque([start_key])
+
+def shortest_paths(graph, start: tuple[int, int]):
+    """Retourne les distances et la première direction vers chaque case atteignable."""
+    if start not in graph:
+        return {}, {}
+
+    distances = {start: 0}
+    first_directions = {start: None}
+    queue = deque([start])
 
     while queue:
         current = queue.popleft()
-        for direction in directions:
-            neighbor_position = graph[current].neighbors.get(direction)
-            if neighbor_position is None:
+        for direction, position in graph[current].neighbors.items():
+            neighbor = (position.x, position.y)
+            if neighbor in distances:
                 continue
-            neighbor = (neighbor_position.x, neighbor_position.y)
-            if neighbor in previous:
-                continue
-            previous[neighbor] = (current, direction)
+            distances[neighbor] = distances[current] + 1
+            first_directions[neighbor] = (
+                direction if current == start else first_directions[current]
+            )
             queue.append(neighbor)
-            if neighbor == target_key:
-                queue.clear()
-                break
 
-    if target_key not in previous:
-        return None
+    return distances, first_directions
 
-    current = target_key
-    while previous[current] is not None:
-        parent, direction = previous[current]
-        if parent == start_key:
-            return direction
-        current = parent
 
-    return None
+def distances_to_targets(graph, targets: set[tuple[int, int]]):
+    """Distance de chaque case atteignable à la case de déchargement la plus proche."""
+    distances = {target: 0 for target in targets if target in graph}
+    queue = deque(distances)
+
+    while queue:
+        current = queue.popleft()
+        for position in graph[current].neighbors.values():
+            neighbor = (position.x, position.y)
+            if neighbor not in distances:
+                distances[neighbor] = distances[current] + 1
+                queue.append(neighbor)
+
+    return distances
 
 
 def unload_targets(state: GameState) -> list[Position]:
@@ -124,52 +225,95 @@ def unload_targets(state: GameState) -> list[Position]:
     return targets
 
 
-def best_snow_target(state: GameState) -> Position | None:
-    """Choisit la case praticable qui contient le plus de neige."""
-    graph = build_graph(state)
-    if not graph:
-        return None
-    node = max(graph.values(), key=lambda candidate: candidate.snow)
-    return node.position if node.snow > 0 else None
+def best_snow_target(
+    graph,
+    start,
+    outbound_distances,
+    return_distances,
+    roads,
+    road_by_cell,
+    plow_id,
+):
+    """Choisit la neige qui maximise N / (temps aller + temps retour)."""
+    best_target = None
+    best_score = 0
+    for key, node in graph.items():
+        if key == start or node.snow <= 0:
+            continue
+        road_key = road_by_cell.get(key)
+        if road_key is not None and roads[road_key].locked_by - {plow_id}:
+            continue
+        if key not in outbound_distances or key not in return_distances:
+            continue
+
+        total_time = outbound_distances[key] + return_distances[key]
+        score = node.snow / total_time
+        if score > best_score:
+            best_score = score
+            best_target = key
+
+    return best_target
+
 
 
 def decide(state: GameState) -> Orders:
     orders = Orders()
-    deposits = unload_targets(state)
+    normal_plow_cost = state.constants["plowCost"]["normal"]
+    if state.money >= normal_plow_cost:
+        orders.buy = "normal"
+
+    graph = build_graph(state)
+    roads, road_by_cell = build_roads(graph)
+    refresh_road_locks(state, roads, road_by_cell)
+    deposit_keys = {
+        (position.x, position.y) for position in unload_targets(state)
+    }
+    return_distances = distances_to_targets(graph, deposit_keys)
+    capacity = state.constants["plowCapacity"]
 
     for plow in state.my_plows:
+        start = (plow.position.x % state.map.width, plow.position.y % state.map.height)
+        plow_graph = graph_without_locked_roads(
+            graph, roads, road_by_cell, plow.id, start
+        )
+        outbound_distances, first_directions = shortest_paths(plow_graph, start)
+        return_distances = distances_to_targets(plow_graph, deposit_keys)
+
         if plow.broken:
-            direction = next_direction_to_target(state, plow.position, state.garage)
-        elif plow.load and deposits:
-            target = next(
-                (
-                    position
-                    for position in deposits
-                    if (
-                        position.x == plow.position.x
-                        and position.y == plow.position.y
-                    )
-                    or next_direction_to_target(state, plow.position, position)
-                    is not None
-                ),
-                None,
-            )
-            if target is None:
-                continue
-            if (
-                plow.position.x % state.map.width == target.x
-                and plow.position.y % state.map.height == target.y
-            ):
+            garage = (state.garage.x, state.garage.y)
+            direction = first_directions.get(garage)
+        elif plow.load is not None and plow.load >= capacity:
+            if start in deposit_keys:
                 orders.unload(plow)
                 continue
-            direction = next_direction_to_target(state, plow.position, target)
+            reachable_deposits = {
+                target
+                for target in deposit_keys.intersection(outbound_distances)
+                if road_by_cell.get(target) is None
+                or not roads[road_by_cell[target]].locked_by - {plow.id}
+            }
+            if not reachable_deposits:
+                continue
+            target = min(reachable_deposits, key=outbound_distances.get)
+            direction = first_directions.get(target)
+            road_key = road_by_cell.get(target)
+            if road_key is not None:
+                roads[road_key].locked_by.add(plow.id)
         else:
-            target = best_snow_target(state)
-            direction = (
-                next_direction_to_target(state, plow.position, target)
-                if target is not None
-                else None
+            target = best_snow_target(
+                graph,
+                start,
+                outbound_distances,
+                return_distances,
+                roads,
+                road_by_cell,
+                plow.id,
             )
+            direction = first_directions.get(target) if target is not None else None
+            road_key = road_by_cell.get(target) if target is not None else None
+            if road_key is not None:
+                roads[road_key].locked_by.add(plow.id)
+
         if direction is not None:
             orders.move(plow, direction)
     return orders
