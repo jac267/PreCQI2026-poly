@@ -1,0 +1,21 @@
+# Partie locale : le serveur de jeu et votre bot.
+#   docker compose up --build
+# Suivez la partie sur http://localhost:8080
+# Mode debug (le tour attend votre bot) : WAIT_FOR_ALL=1 docker compose up --build
+services:
+  server:
+    # serveur de jeu fourni par l'organisation, sous forme d'image Docker
+    image: "${SERVER_IMAGE:-docker.io/jfgauron/snowplow-server:2027}"
+    ports:
+      - "8080:8080"
+    environment:
+      TEAMS: "moi"
+      TICK_MS: "${TICK_MS:-400}"
+      WAIT_FOR_ALL: "${WAIT_FOR_ALL:-0}"
+      SEED: "${SEED:-}"
+
+  bot:
+    build: .
+    environment:
+      SERVER_URL: "http://server:8080/teams/moi"
+    depends_on: [server]
